@@ -18,10 +18,9 @@ impl Description {
         let value_tag = value.tag();
 
         match value_tag {
-            Tag {
-                span: crate::data::meta::Span { start: 0, end: 0 },
-                ..
-            } => Description::Synthetic(value.item.into()),
+            Tag { span, .. } if span.start() == 0 && span.end() == 0 => {
+                Description::Synthetic(value.item.into())
+            }
             _ => Description::Source(Tagged::from_item(value.item.into(), value_tag)),
         }
     }
@@ -77,10 +76,10 @@ impl ShellError {
         .start()
     }
 
-    pub(crate) fn unexpected_eof(expected: impl Into<String>, origin: uuid::Uuid) -> ShellError {
+    pub(crate) fn unexpected_eof(expected: impl Into<String>, tag: Tag) -> ShellError {
         ProximateShellError::UnexpectedEof {
             expected: expected.into(),
-            origin,
+            tag,
         }
         .start()
     }
@@ -274,8 +273,9 @@ impl ShellError {
                 .with_label(Label::new_primary(tag).with_message(expected)),
 
             ProximateShellError::UnexpectedEof {
-                expected, ..
-            } => Diagnostic::new(Severity::Error, format!("Unexpected end of input, expected {}", expected)),
+                expected, tag
+            } => Diagnostic::new(Severity::Error, format!("Unexpected end of input"))
+                .with_label(Label::new_primary(tag).with_message(format!("Expected {}", expected))),
 
             ProximateShellError::RangeError {
                 kind,
@@ -298,10 +298,10 @@ impl ShellError {
                 problem:
                     Tagged {
                         tag,
-                        ..
+                        item
                     },
             } => Diagnostic::new(Severity::Error, "Syntax Error")
-                .with_label(Label::new_primary(tag).with_message("Unexpected external command")),
+                .with_label(Label::new_primary(tag).with_message(item)),
 
             ProximateShellError::MissingProperty { subpath, expr } => {
                 let subpath = subpath.into_label();
@@ -371,6 +371,10 @@ impl ShellError {
     pub(crate) fn unexpected(title: impl Into<String>) -> ShellError {
         ShellError::string(&format!("Unexpected: {}", title.into()))
     }
+
+    pub(crate) fn unreachable(title: impl Into<String>) -> ShellError {
+        ShellError::string(&format!("BUG: Unreachable: {}", title.into()))
+    }
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Ord, PartialOrd, Serialize, Deserialize)]
@@ -420,7 +424,7 @@ pub enum ProximateShellError {
     },
     UnexpectedEof {
         expected: String,
-        origin: uuid::Uuid,
+        tag: Tag,
     },
     InvalidCommand {
         command: Tag,

@@ -155,6 +155,20 @@ impl TokenNode {
         }
     }
 
+    pub fn as_block(&self) -> Option<Tagged<&[TokenNode]>> {
+        match self {
+            TokenNode::Delimited(Tagged {
+                item:
+                    DelimitedNode {
+                        delimiter,
+                        children,
+                    },
+                tag,
+            }) if *delimiter == Delimiter::Brace => Some((&children[..]).tagged(tag)),
+            _ => None,
+        }
+    }
+
     pub fn is_external(&self) -> bool {
         match self {
             TokenNode::Token(Tagged {
@@ -244,8 +258,8 @@ impl TokenNode {
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Getters, new)]
 #[get = "pub(crate)"]
 pub struct DelimitedNode {
-    delimiter: Delimiter,
-    children: Vec<TokenNode>,
+    pub(crate) delimiter: Delimiter,
+    pub(crate) children: Vec<TokenNode>,
 }
 
 impl DelimitedNode {

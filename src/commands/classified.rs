@@ -78,17 +78,24 @@ pub(crate) struct ClassifiedPipeline {
     pub(crate) commands: Vec<ClassifiedCommand>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) enum ClassifiedCommand {
     #[allow(unused)]
     Expr(TokenNode),
     Internal(InternalCommand),
+    Dynamic(hir::Call),
     External(ExternalCommand),
 }
 
-#[derive(new)]
+#[derive(new, Debug, Eq, PartialEq)]
 pub(crate) struct InternalCommand {
-    pub(crate) command: Arc<Command>,
+    pub(crate) name: String,
     pub(crate) name_tag: Tag,
+    pub(crate) args: hir::Call,
+}
+
+#[derive(new, Debug, Eq, PartialEq)]
+pub(crate) struct DynamicCommand {
     pub(crate) args: hir::Call,
 }
 
@@ -101,15 +108,17 @@ impl InternalCommand {
     ) -> Result<InputStream, ShellError> {
         if log_enabled!(log::Level::Trace) {
             trace!(target: "nu::run::internal", "->");
-            trace!(target: "nu::run::internal", "{}", self.command.name());
+            trace!(target: "nu::run::internal", "{}", self.name);
             trace!(target: "nu::run::internal", "{}", self.args.debug(&source));
         }
 
         let objects: InputStream =
             trace_stream!(target: "nu::trace_stream::internal", "input" = input.objects);
 
+        let command = context.get_command(&self.name);
+
         let result = context.run_command(
-            self.command,
+            command,
             self.name_tag.clone(),
             context.source_map.clone(),
             self.args,
@@ -185,6 +194,7 @@ impl InternalCommand {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct ExternalCommand {
     pub(crate) name: String,
 

@@ -16,10 +16,10 @@ pub(crate) use parse::operator::Operator;
 pub(crate) use parse::parser::{nom_input, pipeline};
 pub(crate) use parse::pipeline::{Pipeline, PipelineElement};
 pub(crate) use parse::text::Text;
-pub(crate) use parse::token_tree::TokenNode;
-pub(crate) use parse::tokens::RawToken;
+pub(crate) use parse::token_tree::{DelimitedNode, Delimiter, PathNode, TokenNode};
+pub(crate) use parse::tokens::{RawToken, Token};
 pub(crate) use parse::unit::Unit;
-pub(crate) use parse_command::parse_command;
+pub(crate) use parse_command::parse_command_tail;
 pub(crate) use registry::CommandRegistry;
 
 pub fn parse(input: &str, origin: uuid::Uuid) -> Result<TokenNode, ShellError> {

@@ -400,7 +400,7 @@ impl Value {
     pub(crate) fn type_name(&self) -> String {
         match self {
             Value::Primitive(p) => p.type_name(),
-            Value::Row(_) => format!("object"),
+            Value::Row(_) => format!("row"),
             Value::Table(_) => format!("list"),
             Value::Block(_) => format!("block"),
         }

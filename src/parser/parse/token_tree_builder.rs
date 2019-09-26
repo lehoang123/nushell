@@ -176,8 +176,23 @@ impl TokenTreeBuilder {
         TokenNode::Token(RawToken::ExternalWord.tagged(input.into()))
     }
 
-    pub fn tagged_external(input: impl Into<Tag>, tag: impl Into<Tag>) -> TokenNode {
-        TokenNode::Token(RawToken::ExternalCommand(input.into()).tagged(tag.into()))
+    pub fn external_command(input: impl Into<String>) -> CurriedToken {
+        let input = input.into();
+
+        Box::new(move |b| {
+            let (outer_start, _) = b.consume("^");
+            let (inner_start, end) = b.consume(&input);
+            b.pos = end;
+
+            TokenTreeBuilder::tagged_external_command(
+                (inner_start, end, b.origin),
+                (outer_start, end, b.origin),
+            )
+        })
+    }
+
+    pub fn tagged_external_command(inner: impl Into<Tag>, outer: impl Into<Tag>) -> TokenNode {
+        TokenNode::Token(RawToken::ExternalCommand(inner.into()).tagged(outer.into()))
     }
 
     pub fn int(input: impl Into<BigInt>) -> CurriedToken {

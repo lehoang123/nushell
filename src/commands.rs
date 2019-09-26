@@ -72,6 +72,7 @@ pub(crate) use command::{
     UnevaluatedCallInfo, WholeStreamCommand,
 };
 
+pub(crate) use classified::{ClassifiedCommand, ExternalCommand, InternalCommand};
 pub(crate) use config::Config;
 pub(crate) use cp::Cpy;
 pub(crate) use date::Date;

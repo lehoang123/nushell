@@ -8,7 +8,7 @@ pub(crate) mod path;
 pub(crate) mod syntax_shape;
 pub(crate) mod tokens_iterator;
 
-use crate::parser::{registry, Unit};
+use crate::parser::{registry, Operator, Unit};
 use crate::prelude::*;
 use derive_new::new;
 use getset::Getters;
@@ -18,12 +18,14 @@ use std::path::PathBuf;
 
 use crate::evaluate::Scope;
 
-pub(crate) use self::baseline_parse_tokens::baseline_parse_next_expr;
 pub(crate) use self::binary::Binary;
 pub(crate) use self::external_command::ExternalCommand;
 pub(crate) use self::named::NamedArguments;
 pub(crate) use self::path::Path;
-pub(crate) use self::syntax_shape::{ExpandContext, ExpandExpression};
+pub(crate) use self::syntax_shape::{
+    expand_expr, expand_syntax, ExpandContext, ExpandExpression, ExpandSyntax,
+};
+pub(crate) use self::tokens_iterator::debug::debug_tokens;
 pub(crate) use self::tokens_iterator::TokensIterator;
 
 pub use self::syntax_shape::SyntaxShape;
@@ -84,8 +86,8 @@ pub enum RawExpression {
     Path(Box<Path>),
 
     FilePath(PathBuf),
-    Command,
     ExternalCommand(ExternalCommand),
+    Command(Tag),
 
     Boolean(bool),
 }
@@ -108,14 +110,14 @@ impl RawExpression {
         match self {
             RawExpression::Literal(literal) => literal.type_name(),
             RawExpression::Synthetic(synthetic) => synthetic.type_name(),
-            RawExpression::Command => "command",
-            RawExpression::ExternalWord => "externalword",
-            RawExpression::FilePath(..) => "filepath",
+            RawExpression::Command(..) => "command",
+            RawExpression::ExternalWord => "external word",
+            RawExpression::FilePath(..) => "file path",
             RawExpression::Variable(..) => "variable",
             RawExpression::List(..) => "list",
             RawExpression::Binary(..) => "binary",
             RawExpression::Block(..) => "block",
-            RawExpression::Path(..) => "path",
+            RawExpression::Path(..) => "variable path",
             RawExpression::Boolean(..) => "boolean",
             RawExpression::ExternalCommand(..) => "external",
         }
@@ -154,8 +156,39 @@ impl Expression {
         RawExpression::Path(Box::new(Path::new(head, tail))).tagged(tag.into())
     }
 
+    pub(crate) fn dot_member(head: Expression, next: Tagged<impl Into<String>>) -> Expression {
+        let Tagged { item, tag } = head;
+        let new_tag = head.tag.until(next.tag);
+
+        match item {
+            RawExpression::Path(path) => {
+                let (head, mut tail) = path.parts();
+
+                tail.push(next.map(|i| i.into()));
+                Expression::path(head, tail, new_tag)
+            }
+
+            other => Expression::path(other.tagged(tag), vec![next], new_tag),
+        }
+    }
+
+    pub(crate) fn infix(
+        left: Expression,
+        op: Tagged<impl Into<Operator>>,
+        right: Expression,
+    ) -> Expression {
+        let new_tag = left.tag.until(right.tag);
+
+        RawExpression::Binary(Box::new(Binary::new(left, op.map(|o| o.into()), right)))
+            .tagged(new_tag)
+    }
+
     pub(crate) fn file_path(path: impl Into<PathBuf>, outer: impl Into<Tag>) -> Expression {
         RawExpression::FilePath(path.into()).tagged(outer)
+    }
+
+    pub(crate) fn list(list: Vec<Expression>, tag: impl Into<Tag>) -> Expression {
+        RawExpression::List(list).tagged(tag)
     }
 
     pub(crate) fn bare(tag: impl Into<Tag>) -> Expression {
@@ -185,7 +218,7 @@ impl ToDebug for Expression {
             RawExpression::Literal(l) => l.tagged(self.tag()).fmt_debug(f, source),
             RawExpression::FilePath(p) => write!(f, "{}", p.display()),
             RawExpression::ExternalWord => write!(f, "{}", self.tag().slice(source)),
-            RawExpression::Command => write!(f, "{}", self.tag().slice(source)),
+            RawExpression::Command(tag) => write!(f, "{}", tag.slice(source)),
             RawExpression::Synthetic(Synthetic::String(s)) => write!(f, "{:?}", s),
             RawExpression::Variable(Variable::It(_)) => write!(f, "$it"),
             RawExpression::Variable(Variable::Other(s)) => write!(f, "${}", s.slice(source)),

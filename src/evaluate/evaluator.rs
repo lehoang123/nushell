@@ -48,8 +48,8 @@ pub(crate) fn evaluate_baseline_expr(
         RawExpression::Synthetic(hir::Synthetic::String(s)) => {
             Ok(Value::string(s).tagged_unknown())
         }
-        RawExpression::Variable(var) => evaluate_reference(var, scope, source),
-        RawExpression::Command => evaluate_command(expr.tag(), scope, source),
+        RawExpression::Variable(var) => evaluate_reference(var, scope, source, expr.tag()),
+        RawExpression::Command(tag) => evaluate_command(expr.tag(), scope, source),
         RawExpression::ExternalCommand(external) => evaluate_external(external, scope, source),
         RawExpression::Binary(binary) => {
             let left = evaluate_baseline_expr(binary.left(), registry, scope, source)?;
@@ -121,14 +121,15 @@ fn evaluate_reference(
     name: &hir::Variable,
     scope: &Scope,
     source: &Text,
+    tag: Tag,
 ) -> Result<Tagged<Value>, ShellError> {
     match name {
-        hir::Variable::It(tag) => Ok(scope.it.item.clone().tagged(*tag)),
-        hir::Variable::Other(tag) => Ok(scope
+        hir::Variable::It(_) => Ok(scope.it.item.clone().tagged(tag)),
+        hir::Variable::Other(inner) => Ok(scope
             .vars
-            .get(tag.slice(source))
+            .get(inner.slice(source))
             .map(|v| v.clone())
-            .unwrap_or_else(|| Value::nothing().tagged(*tag))),
+            .unwrap_or_else(|| Value::nothing().tagged(tag))),
     }
 }
 

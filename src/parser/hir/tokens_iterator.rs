@@ -1,16 +1,43 @@
+pub(crate) mod debug;
+
 use crate::errors::ShellError;
 use crate::parser::TokenNode;
+use crate::traits::ToDebug;
+use crate::{Tag, Tagged, TaggedItem};
 use derive_new::new;
 
 #[derive(Debug, new)]
 pub struct TokensIterator<'a> {
     tokens: &'a [TokenNode],
-    origin: uuid::Uuid,
+    tag: Tag,
     skip_ws: bool,
     #[new(default)]
     index: usize,
     #[new(default)]
     seen: indexmap::IndexSet<usize>,
+}
+
+#[derive(Debug)]
+pub struct Checkpoint<'content, 'me> {
+    pub(crate) iterator: &'me mut TokensIterator<'content>,
+    index: usize,
+    seen: indexmap::IndexSet<usize>,
+    committed: bool,
+}
+
+impl<'content, 'me> Checkpoint<'content, 'me> {
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl<'content, 'me> std::ops::Drop for Checkpoint<'content, 'me> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.iterator.index = self.index;
+            self.iterator.seen = self.seen.clone();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -22,7 +49,7 @@ pub struct Peeked<'content, 'me> {
 }
 
 impl<'content, 'me> Peeked<'content, 'me> {
-    pub fn commit(self) -> Option<&'content TokenNode> {
+    pub fn commit(&mut self) -> Option<&'content TokenNode> {
         let Peeked {
             node,
             iterator,
@@ -30,9 +57,13 @@ impl<'content, 'me> Peeked<'content, 'me> {
             to,
         } = self;
 
-        let node = node?;
-        iterator.commit(from, to);
+        let node = (*node)?;
+        iterator.commit(*from, *to);
         Some(node)
+    }
+
+    pub fn origin(&self) -> uuid::Uuid {
+        self.iterator.tag.origin
     }
 
     pub fn not_eof(
@@ -40,7 +71,10 @@ impl<'content, 'me> Peeked<'content, 'me> {
         expected: impl Into<String>,
     ) -> Result<PeekedNode<'content, 'me>, ShellError> {
         match self.node {
-            None => Err(ShellError::unexpected_eof(expected, self.iterator.origin)),
+            None => Err(ShellError::unexpected_eof(
+                expected,
+                self.iterator.eof_tag(),
+            )),
             Some(node) => Ok(PeekedNode {
                 node,
                 iterator: self.iterator,
@@ -50,8 +84,8 @@ impl<'content, 'me> Peeked<'content, 'me> {
         }
     }
 
-    pub fn type_error(self, expected: impl Into<String>) -> ShellError {
-        peek_error(self.node, self.iterator.origin, expected)
+    pub fn type_error(&self, expected: impl Into<String>) -> ShellError {
+        peek_error(&self.node, self.iterator.eof_tag(), expected)
     }
 }
 
@@ -75,23 +109,75 @@ impl<'content, 'me> PeekedNode<'content, 'me> {
         iterator.commit(from, to);
         node
     }
+
+    pub fn rollback(self) {}
 }
 
 pub fn peek_error(
-    node: Option<&TokenNode>,
-    origin: uuid::Uuid,
+    node: &Option<&TokenNode>,
+    eof_tag: Tag,
     expected: impl Into<String>,
 ) -> ShellError {
     match node {
-        None => ShellError::unexpected_eof(expected, origin),
+        None => ShellError::unexpected_eof(expected, eof_tag),
         Some(node) => ShellError::type_error(expected, node.tagged_type_name()),
     }
 }
 
 impl<'content> TokensIterator<'content> {
     #[cfg(test)]
-    pub fn all(tokens: &'content [TokenNode], origin: uuid::Uuid) -> TokensIterator<'content> {
-        TokensIterator::new(tokens, origin, false)
+    pub fn all(tokens: &'content [TokenNode], tag: Tag) -> TokensIterator<'content> {
+        TokensIterator::new(tokens, tag, false)
+    }
+
+    /// Use a checkpoint when you need to peek more than one token ahead, but can't be sure
+    /// that you'll succeed.
+    pub fn checkpoint<'me>(&'me mut self) -> Checkpoint<'content, 'me> {
+        let index = self.index;
+        let seen = self.seen.clone();
+
+        Checkpoint {
+            iterator: self,
+            index,
+            seen,
+            committed: false,
+        }
+    }
+
+    pub fn debug(&self, source: &str) -> String {
+        let mut out = vec![];
+
+        for token in self.tokens {
+            out.push(format!("[[ {} ]]", token.debug(source)));
+        }
+
+        out.join(" ")
+    }
+
+    pub fn origin(&self) -> uuid::Uuid {
+        self.tag.origin
+    }
+
+    fn eof_tag(&self) -> Tag {
+        Tag::from((self.tag.span.end(), self.tag.span.end(), self.tag.origin))
+    }
+
+    pub fn cursor_tag(&mut self) -> Tag {
+        let next = self.peek_any();
+
+        match next.node {
+            None => self.eof_tag(),
+            Some(node) => node.tag(),
+        }
+    }
+
+    pub fn typed_tag_at_cursor(&mut self) -> Tagged<&'static str> {
+        let next = self.peek_any();
+
+        match next.node {
+            None => "end".tagged(self.eof_tag()),
+            Some(node) => node.tagged_type_name(),
+        }
     }
 
     pub fn remove(&mut self, position: usize) {
@@ -100,6 +186,10 @@ impl<'content> TokensIterator<'content> {
 
     pub fn at_end(&self) -> bool {
         peek(self, self.skip_ws).is_none()
+    }
+
+    pub fn at_end_possible_ws(&self) -> bool {
+        peek(self, true).is_none()
     }
 
     pub fn advance(&mut self) {
@@ -138,7 +228,7 @@ impl<'content> TokensIterator<'content> {
     pub fn clone(&self) -> TokensIterator<'content> {
         TokensIterator {
             tokens: self.tokens,
-            origin: self.origin,
+            tag: self.tag,
             index: self.index,
             seen: self.seen.clone(),
             skip_ws: self.skip_ws,
@@ -147,13 +237,13 @@ impl<'content> TokensIterator<'content> {
 
     // Get the next token, not including whitespace
     pub fn next_non_ws(&mut self) -> Option<&TokenNode> {
-        let peeked = start_next(self, true);
+        let mut peeked = start_next(self, true);
         peeked.commit()
     }
 
     // Peek the next token, not including whitespace
     pub fn peek_non_ws<'me>(&'me mut self) -> Peeked<'content, 'me> {
-        start_next(self, false)
+        start_next(self, true)
     }
 
     // Peek the next token, including whitespace

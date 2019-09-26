@@ -53,13 +53,17 @@ impl CommandRegistry {
         registry.get(name).map(|c| c.clone())
     }
 
+    pub(crate) fn expect_command(&self, name: &str) -> Arc<Command> {
+        self.get_command(name).unwrap()
+    }
+
     pub(crate) fn has(&self, name: &str) -> bool {
         let registry = self.registry.lock().unwrap();
 
         registry.contains_key(name)
     }
 
-    fn insert(&mut self, name: impl Into<String>, command: Arc<Command>) {
+    pub(crate) fn insert(&mut self, name: impl Into<String>, command: Arc<Command>) {
         let mut registry = self.registry.lock().unwrap();
         registry.insert(name.into(), command);
     }
@@ -83,8 +87,12 @@ impl Context {
         &self.registry
     }
 
-    pub(crate) fn expand_context(&self, origin: uuid::Uuid) -> ExpandContext {
-        ExpandContext::new(&self.registry, origin, self.shell_manager.homedir())
+    pub(crate) fn expand_context<'context>(
+        &'context self,
+        source: &'context Text,
+        tag: Tag,
+    ) -> ExpandContext<'context> {
+        ExpandContext::new(&self.registry, tag, source, self.shell_manager.homedir())
     }
 
     pub(crate) fn basic() -> Result<Context, Box<dyn Error>> {

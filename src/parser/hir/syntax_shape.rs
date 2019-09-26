@@ -1,15 +1,40 @@
+mod block;
+mod expression;
+
+use self::expression::expand_file_path;
+use crate::cli::external_command;
+use crate::commands::{classified::InternalCommand, ClassifiedCommand, Command};
+use crate::parser::hir::syntax_shape::block::AnyBlockShape;
 use crate::parser::hir::tokens_iterator::Peeked;
-use crate::parser::{hir, hir::TokensIterator, Operator, RawToken, TokenNode};
+use crate::parser::parse_command::parse_command_tail;
+use crate::parser::{
+    hir,
+    hir::{debug_tokens, TokensIterator},
+    Operator, RawToken, Token, TokenNode,
+};
 use crate::prelude::*;
+use crate::traits::ToDebug;
 use derive_new::new;
 use getset::Getters;
+use itertools::Itertools;
+use log::trace;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+pub(crate) use self::expression::file_path::FilePathShape;
+pub(crate) use self::expression::list::ExpressionListShape;
+pub(crate) use self::expression::number::NumberShape;
+pub(crate) use self::expression::pattern::PatternShape;
+pub(crate) use self::expression::string::StringShape;
+pub(crate) use self::expression::variable_path::{
+    DotShape, ExpressionContinuation, ExpressionContinuationShape, MemberShape, PathTailShape,
+    VariablePathShape,
+};
+pub(crate) use self::expression::{continue_expression, AnyExpressionShape};
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub enum SyntaxShape {
     Any,
-    CommandHead,
     List,
     Literal,
     String,
@@ -24,29 +49,27 @@ pub enum SyntaxShape {
 }
 
 impl ExpandExpression for SyntaxShape {
-    fn expand<'a, 'b>(
+    fn expand_expr<'a, 'b>(
         &self,
         token_nodes: &'b mut TokensIterator<'a>,
         context: &ExpandContext,
-        source: &Text,
-        origin: uuid::Uuid,
     ) -> Result<hir::Expression, ShellError> {
         match self {
-            SyntaxShape::Any => AnyExpressionShape.expand(token_nodes, context, source, origin),
-            SyntaxShape::CommandHead => {
-                CommandHeadShape.expand(token_nodes, context, source, origin)
+            SyntaxShape::Any => expand_expr(&AnyExpressionShape, token_nodes, context),
+            SyntaxShape::List => Err(ShellError::unimplemented("SyntaxShape:List")),
+            SyntaxShape::Literal => Err(ShellError::unimplemented("SyntaxShape:Literal")),
+            SyntaxShape::String => expand_expr(&StringShape, token_nodes, context),
+            SyntaxShape::Member => {
+                let syntax = expand_syntax(&MemberShape, token_nodes, context)?;
+                Ok(syntax.to_expr())
             }
-            SyntaxShape::List => unimplemented!(),
-            SyntaxShape::Literal => unimplemented!(),
-            SyntaxShape::String => StringShape.expand(token_nodes, context, source, origin),
-            SyntaxShape::Member => unimplemented!(),
-            SyntaxShape::Variable => unimplemented!(),
-            SyntaxShape::Number => NumberShape.expand(token_nodes, context, source, origin),
-            SyntaxShape::Path => unimplemented!(),
-            SyntaxShape::Pattern => PatternShape.expand(token_nodes, context, source, origin),
-            SyntaxShape::Binary => unimplemented!(),
-            SyntaxShape::Block => unimplemented!(),
-            SyntaxShape::Boolean => unimplemented!(),
+            SyntaxShape::Variable => Err(ShellError::unimplemented("SyntaxShape:Variable")),
+            SyntaxShape::Number => expand_expr(&NumberShape, token_nodes, context),
+            SyntaxShape::Path => expand_expr(&FilePathShape, token_nodes, context),
+            SyntaxShape::Pattern => expand_expr(&PatternShape, token_nodes, context),
+            SyntaxShape::Binary => Err(ShellError::unimplemented("SyntaxShape:Binary")),
+            SyntaxShape::Block => expand_expr(&AnyBlockShape, token_nodes, context),
+            SyntaxShape::Boolean => Err(ShellError::unimplemented("SyntaxShape:Boolean")),
         }
     }
 }
@@ -55,7 +78,6 @@ impl std::fmt::Display for SyntaxShape {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             SyntaxShape::Any => write!(f, "Any"),
-            SyntaxShape::CommandHead => write!(f, "CommandHead"),
             SyntaxShape::List => write!(f, "List"),
             SyntaxShape::Literal => write!(f, "Literal"),
             SyntaxShape::String => write!(f, "String"),
@@ -76,7 +98,9 @@ pub struct ExpandContext<'context> {
     #[get = "pub(crate)"]
     registry: &'context CommandRegistry,
     #[get = "pub(crate)"]
-    origin: uuid::Uuid,
+    tag: Tag,
+    #[get = "pub(crate)"]
+    source: &'context Text,
     homedir: Option<PathBuf>,
 }
 
@@ -85,13 +109,22 @@ impl<'context> ExpandContext<'context> {
         self.homedir.as_ref().map(|h| h.as_path())
     }
 
+    pub(crate) fn origin(&self) -> uuid::Uuid {
+        self.tag.origin
+    }
+
     #[cfg(test)]
-    pub fn with_empty(callback: impl FnOnce(ExpandContext)) {
-        let registry = CommandRegistry::new();
+    pub fn with_empty(source: &Text, callback: impl FnOnce(ExpandContext)) {
+        let mut registry = CommandRegistry::new();
+        registry.insert(
+            "ls",
+            crate::commands::whole_stream_command(crate::commands::LS),
+        );
 
         callback(ExpandContext {
             registry: &registry,
-            origin: uuid::Uuid::nil(),
+            tag: Tag::unknown(),
+            source,
             homedir: None,
         })
     }
@@ -102,31 +135,81 @@ pub trait TestSyntax: std::fmt::Debug + Copy {
         &self,
         token_nodes: &'b mut TokensIterator<'a>,
         context: &ExpandContext,
-        source: &Text,
-        origin: uuid::Uuid,
     ) -> Option<Peeked<'a, 'b>>;
 }
 
 pub trait ExpandExpression: std::fmt::Debug + Copy {
-    fn expand<'a, 'b>(
+    fn expand_expr<'a, 'b>(
         &self,
         token_nodes: &'b mut TokensIterator<'a>,
         context: &ExpandContext,
-        source: &Text,
-        origin: uuid::Uuid,
     ) -> Result<hir::Expression, ShellError>;
 }
 
-pub trait ExpandSyntax: std::fmt::Debug + Copy {
-    type Output;
+pub(crate) trait ExpandSyntax: std::fmt::Debug + Copy {
+    type Output: std::fmt::Debug;
 
-    fn expand<'a, 'b>(
+    fn expand_syntax<'a, 'b>(
         &self,
         token_nodes: &'b mut TokensIterator<'a>,
         context: &ExpandContext,
-        source: &Text,
-        origin: uuid::Uuid,
     ) -> Result<Self::Output, ShellError>;
+}
+
+pub(crate) fn expand_syntax<'a, 'b, T: ExpandSyntax>(
+    shape: &T,
+    token_nodes: &'b mut TokensIterator<'a>,
+    context: &ExpandContext,
+) -> Result<T::Output, ShellError> {
+    trace!(target: "nu::expand_syntax", "before {} :: {:?}", std::any::type_name::<T>(), debug_tokens(token_nodes, context.source));
+
+    let result = shape.expand_syntax(token_nodes, context);
+
+    match result {
+        Err(err) => {
+            trace!(target: "nu::expand_syntax", "error :: {} :: {:?}", err, debug_tokens(token_nodes, context.source));
+            Err(err)
+        }
+
+        Ok(result) => {
+            trace!(target: "nu::expand_syntax", "ok :: {:?} :: {:?}", result, debug_tokens(token_nodes, context.source));
+            Ok(result)
+        }
+    }
+}
+
+pub(crate) fn expand_expr<'a, 'b, T: ExpandExpression>(
+    shape: &T,
+    token_nodes: &'b mut TokensIterator<'a>,
+    context: &ExpandContext,
+) -> Result<hir::Expression, ShellError> {
+    trace!(target: "nu::expand_syntax", "before {} :: {:?}", std::any::type_name::<T>(), debug_tokens(token_nodes, context.source));
+
+    let result = shape.expand_syntax(token_nodes, context);
+
+    match result {
+        Err(err) => {
+            trace!(target: "nu::expand_syntax", "error :: {} :: {:?}", err, debug_tokens(token_nodes, context.source));
+            Err(err)
+        }
+
+        Ok(result) => {
+            trace!(target: "nu::expand_syntax", "ok :: {:?} :: {:?}", result, debug_tokens(token_nodes, context.source));
+            Ok(result)
+        }
+    }
+}
+
+impl<T: ExpandExpression> ExpandSyntax for T {
+    type Output = hir::Expression;
+
+    fn expand_syntax<'a, 'b>(
+        &self,
+        token_nodes: &'b mut TokensIterator<'a>,
+        context: &ExpandContext,
+    ) -> Result<Self::Output, ShellError> {
+        ExpandExpression::expand_expr(self, token_nodes, context)
+    }
 }
 
 pub trait SkipSyntax: std::fmt::Debug + Copy {
@@ -134,21 +217,130 @@ pub trait SkipSyntax: std::fmt::Debug + Copy {
         &self,
         token_nodes: &'b mut TokensIterator<'a>,
         context: &ExpandContext,
-        source: &Text,
-        origin: uuid::Uuid,
     ) -> Result<(), ShellError>;
+}
+
+enum BarePathState {
+    Initial,
+    Seen(Tag, Tag),
+    Error(ShellError),
+}
+
+impl BarePathState {
+    pub fn seen(self, tag: Tag) -> BarePathState {
+        match self {
+            BarePathState::Initial => BarePathState::Seen(tag, tag),
+            BarePathState::Seen(start, _) => BarePathState::Seen(start, tag),
+            BarePathState::Error(err) => BarePathState::Error(err),
+        }
+    }
+
+    pub fn end(self, peeked: Peeked, reason: impl Into<String>) -> BarePathState {
+        match self {
+            BarePathState::Initial => BarePathState::Error(peeked.type_error(reason)),
+            BarePathState::Seen(start, end) => BarePathState::Seen(start, end),
+            BarePathState::Error(err) => BarePathState::Error(err),
+        }
+    }
+
+    pub fn into_bare(self) -> Result<Tag, ShellError> {
+        match self {
+            BarePathState::Initial => unreachable!("into_bare in initial state"),
+            BarePathState::Seen(start, end) => Ok(start.until(end)),
+            BarePathState::Error(err) => Err(err),
+        }
+    }
+}
+
+pub fn expand_bare<'a, 'b>(
+    token_nodes: &'b mut TokensIterator<'a>,
+    _context: &ExpandContext,
+    predicate: impl Fn(&TokenNode) -> bool,
+) -> Result<Tag, ShellError> {
+    let mut state = BarePathState::Initial;
+
+    loop {
+        // Whitespace ends a word
+        let mut peeked = token_nodes.peek_any();
+
+        match peeked.node {
+            None => {
+                state = state.end(peeked, "word");
+                break;
+            }
+            Some(node) => {
+                if predicate(node) {
+                    state = state.seen(node.tag());
+                    peeked.commit();
+                } else {
+                    state = state.end(peeked, "word");
+                    break;
+                }
+            }
+        }
+    }
+
+    state.into_bare()
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct BarePathShape;
+
+impl ExpandSyntax for BarePathShape {
+    type Output = Tag;
+
+    fn expand_syntax<'a, 'b>(
+        &self,
+        token_nodes: &'b mut TokensIterator<'a>,
+        context: &ExpandContext,
+    ) -> Result<Tag, ShellError> {
+        expand_bare(token_nodes, context, |token| match token {
+            TokenNode::Token(Tagged {
+                item: RawToken::Bare,
+                ..
+            })
+            | TokenNode::Token(Tagged {
+                item: RawToken::Operator(Operator::Dot),
+                ..
+            }) => true,
+
+            _ => false,
+        })
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
 pub struct BareShape;
 
+impl ExpandSyntax for BareShape {
+    type Output = Tagged<String>;
+
+    fn expand_syntax<'a, 'b>(
+        &self,
+        token_nodes: &'b mut TokensIterator<'a>,
+        context: &ExpandContext,
+    ) -> Result<Self::Output, ShellError> {
+        let peeked = token_nodes.peek_any().not_eof("word")?;
+
+        match peeked.node {
+            TokenNode::Token(Tagged {
+                item: RawToken::Bare,
+                tag,
+            }) => {
+                peeked.commit();
+                Ok(tag.tagged_string(context.source))
+            }
+
+            other => Err(ShellError::type_error("word", other.tagged_type_name())),
+        }
+    }
+}
+
 impl TestSyntax for BareShape {
     fn test<'a, 'b>(
         &self,
         token_nodes: &'b mut TokensIterator<'a>,
-        _context: &ExpandContext,
-        _source: &Text,
-        _origin: uuid::Uuid,
+        context: &ExpandContext,
     ) -> Option<Peeked<'a, 'b>> {
         let peeked = token_nodes.peek_any();
 
@@ -163,368 +355,131 @@ impl TestSyntax for BareShape {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
-pub struct DotShape;
-
-impl SkipSyntax for DotShape {
-    fn skip<'a, 'b>(
-        &self,
-        token_nodes: &mut TokensIterator<'_>,
-        _context: &ExpandContext,
-        source: &Text,
-        origin: uuid::Uuid,
-    ) -> Result<(), ShellError> {
-        parse_single_node(token_nodes, "dot", source, origin, |token, token_tag| {
-            Ok(match token {
-                RawToken::Operator(Operator::Dot) => {}
-                _ => {
-                    return Err(ShellError::type_error(
-                        "dot",
-                        token.type_name().tagged(token_tag),
-                    ))
-                }
-            })
-        })?;
-
-        Ok(())
-    }
+#[derive(Debug)]
+pub enum CommandSignature {
+    Internal(Tagged<Arc<Command>>),
+    LiteralExternal { outer: Tag, inner: Tag },
+    External(Tag),
+    Expression(hir::Expression),
 }
 
-#[derive(Debug, Copy, Clone)]
-pub struct StringShape;
-
-impl ExpandExpression for StringShape {
-    fn expand<'a, 'b>(
-        &self,
-        token_nodes: &mut TokensIterator<'_>,
-        _context: &ExpandContext,
-        source: &Text,
-        origin: uuid::Uuid,
-    ) -> Result<hir::Expression, ShellError> {
-        parse_single_node(token_nodes, "String", source, origin, |token, token_tag| {
-            Ok(match token {
-                RawToken::GlobPattern => {
-                    return Err(ShellError::type_error(
-                        "String",
-                        "glob pattern".tagged(token_tag),
-                    ))
-                }
-                RawToken::Operator(..) => {
-                    return Err(ShellError::type_error(
-                        "String",
-                        "operator".tagged(token_tag),
-                    ))
-                }
-                RawToken::Variable(tag) if tag.slice(source) == "it" => {
-                    hir::Expression::it_variable(tag, token_tag)
-                }
-                RawToken::ExternalCommand(tag) => hir::Expression::external_command(tag, token_tag),
-                RawToken::ExternalWord => return Err(ShellError::invalid_external_word(token_tag)),
-                RawToken::Variable(tag) => hir::Expression::variable(tag, token_tag),
-                RawToken::Number(_) => hir::Expression::bare(token_tag),
-                RawToken::Size(_, _) => hir::Expression::bare(token_tag),
-                RawToken::Bare => hir::Expression::bare(token_tag),
-                RawToken::String(tag) => hir::Expression::string(tag, token_tag),
-            })
-        })
-    }
-}
-
-impl TestSyntax for StringShape {
-    fn test<'a, 'b>(
-        &self,
-        token_nodes: &'b mut TokensIterator<'a>,
-        _context: &ExpandContext,
-        _source: &Text,
-        _origin: uuid::Uuid,
-    ) -> Option<Peeked<'a, 'b>> {
-        let peeked = token_nodes.peek_any();
-
-        match peeked.node {
-            Some(TokenNode::Token(token)) => match token.item {
-                RawToken::String(_) => Some(peeked),
-                _ => None,
-            },
-
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-pub struct NumberShape;
-
-impl ExpandExpression for NumberShape {
-    fn expand<'a, 'b>(
-        &self,
-        token_nodes: &mut TokensIterator<'_>,
-        _context: &ExpandContext,
-        source: &Text,
-        origin: uuid::Uuid,
-    ) -> Result<hir::Expression, ShellError> {
-        parse_single_node(token_nodes, "Number", source, origin, |token, token_tag| {
-            Ok(match token {
-                RawToken::GlobPattern => {
-                    return Err(ShellError::type_error(
-                        "Number",
-                        "glob pattern".to_string().tagged(token_tag),
-                    ))
-                }
-                RawToken::Operator(..) => {
-                    return Err(ShellError::type_error(
-                        "Number",
-                        "operator".to_string().tagged(token_tag),
-                    ))
-                }
-                RawToken::Variable(tag) if tag.slice(source) == "it" => {
-                    hir::Expression::it_variable(tag, token_tag)
-                }
-                RawToken::ExternalCommand(tag) => hir::Expression::external_command(tag, token_tag),
-                RawToken::ExternalWord => return Err(ShellError::invalid_external_word(token_tag)),
-                RawToken::Variable(tag) => hir::Expression::variable(tag, token_tag),
-                RawToken::Number(number) => {
-                    hir::Expression::number(number.to_number(source), token_tag)
-                }
-                RawToken::Size(number, unit) => {
-                    hir::Expression::size(number.to_number(source), unit, token_tag)
-                }
-                RawToken::Bare => hir::Expression::bare(token_tag),
-                RawToken::String(tag) => hir::Expression::string(tag, token_tag),
-            })
-        })
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-pub struct PatternShape;
-
-impl ExpandExpression for PatternShape {
-    fn expand<'a, 'b>(
-        &self,
-        token_nodes: &mut TokensIterator<'_>,
-        context: &ExpandContext,
-        source: &Text,
-        origin: uuid::Uuid,
-    ) -> Result<hir::Expression, ShellError> {
-        parse_single_node(
-            token_nodes,
-            "Pattern",
-            source,
-            origin,
-            |token, token_tag| {
-                Ok(match token {
-                    RawToken::Variable(tag) if tag.slice(source) == "it" => {
-                        hir::Expression::it_variable(tag, token_tag)
-                    }
-                    RawToken::ExternalCommand(_) => {
-                        return Err(ShellError::syntax_error(
-                            "Invalid external command".to_string().tagged(token_tag),
-                        ))
-                    }
-                    RawToken::Operator(..) => {
-                        return Err(ShellError::type_error(
-                            "glob pattern",
-                            "operator".to_string().tagged(token_tag),
-                        ))
-                    }
-                    RawToken::ExternalWord => {
-                        return Err(ShellError::invalid_external_word(token_tag))
-                    }
-                    RawToken::Variable(tag) => hir::Expression::variable(tag, token_tag),
-                    RawToken::Number(_) => hir::Expression::bare(token_tag),
-                    RawToken::Size(_, _) => hir::Expression::bare(token_tag),
-                    RawToken::GlobPattern => hir::Expression::pattern(token_tag),
-                    RawToken::Bare => hir::Expression::file_path(
-                        expand_file_path(token_tag.slice(source), context),
-                        token_tag,
-                    ),
-                    RawToken::String(tag) => hir::Expression::file_path(
-                        expand_file_path(tag.slice(source), &context),
-                        token_tag,
-                    ),
-                })
-            },
-        )
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-pub struct FilePathShape;
-
-impl ExpandExpression for FilePathShape {
-    fn expand<'a, 'b>(
-        &self,
-        token_nodes: &mut TokensIterator<'_>,
-        context: &ExpandContext,
-        source: &Text,
-        origin: uuid::Uuid,
-    ) -> Result<hir::Expression, ShellError> {
-        parse_single_node(token_nodes, "Path", source, origin, |token, token_tag| {
-            Ok(match token {
-                RawToken::GlobPattern => {
-                    return Err(ShellError::type_error(
-                        "Path",
-                        "glob pattern".tagged(token_tag),
-                    ))
-                }
-                RawToken::Operator(..) => {
-                    return Err(ShellError::type_error("Path", "operator".tagged(token_tag)))
-                }
-                RawToken::Variable(tag) if tag.slice(source) == "it" => {
-                    hir::Expression::it_variable(tag, token_tag)
-                }
-                RawToken::Variable(tag) => hir::Expression::variable(tag, token_tag),
-                RawToken::ExternalCommand(tag) => hir::Expression::external_command(tag, token_tag),
-                RawToken::ExternalWord => return Err(ShellError::invalid_external_word(token_tag)),
-                RawToken::Number(_) => hir::Expression::bare(token_tag),
-                RawToken::Size(_, _) => hir::Expression::bare(token_tag),
-                RawToken::Bare => hir::Expression::file_path(
-                    expand_file_path(token_tag.slice(source), context),
-                    token_tag,
-                ),
-
-                RawToken::String(tag) => hir::Expression::file_path(
-                    expand_file_path(tag.slice(source), context),
-                    token_tag,
-                ),
-            })
-        })
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-pub struct VariablePathShape;
-
-impl ExpandExpression for VariablePathShape {
-    fn expand<'a, 'b>(
-        &self,
-        token_nodes: &mut TokensIterator<'_>,
-        context: &ExpandContext,
-        source: &Text,
-        origin: uuid::Uuid,
-    ) -> Result<hir::Expression, ShellError> {
-        // 1. let the head be the first token, expecting a variable
-        // 2. let the tail be an empty list of members
-        // 2. while the next token (excluding ws) is a dot:
-        //   1. consume the dot
-        //   2. consume the next token as a member and push it onto tail
-
-        let head = VariableShape.expand(token_nodes, context, source, origin)?;
-        let start = head.tag();
-        let mut end = start;
-        let mut tail: Vec<Tagged<String>> = vec![];
-
-        loop {
-            println!("end={:?} tail={:?}", end, tail);
-
-            match DotShape.skip(token_nodes, context, source, origin) {
-                Err(_) => break,
-                Ok(_) => {}
+impl CommandSignature {
+    pub fn to_expression(&self) -> hir::Expression {
+        match self {
+            CommandSignature::Internal(command) => {
+                let tag = command.tag;
+                hir::RawExpression::Command(tag).tagged(tag)
             }
-
-            let member = MemberShape.expand(token_nodes, context, source, origin)?;
-            end = member.tag();
-            tail.push(member);
+            CommandSignature::LiteralExternal { outer, inner } => {
+                hir::RawExpression::ExternalCommand(hir::ExternalCommand::new(*inner)).tagged(outer)
+            }
+            CommandSignature::External(tag) => {
+                hir::RawExpression::ExternalCommand(hir::ExternalCommand::new(*tag)).tagged(tag)
+            }
+            CommandSignature::Expression(expr) => expr.clone(),
         }
-
-        Ok(hir::Expression::path(head, tail, start.until(end)))
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-pub struct VariableShape;
-
-impl ExpandExpression for VariableShape {
-    fn expand<'a, 'b>(
-        &self,
-        token_nodes: &mut TokensIterator<'_>,
-        _context: &ExpandContext,
-        source: &Text,
-        origin: uuid::Uuid,
-    ) -> Result<hir::Expression, ShellError> {
-        parse_single_node(
-            token_nodes,
-            "variable",
-            source,
-            origin,
-            |token, token_tag| {
-                Ok(match token {
-                    RawToken::Variable(tag) => hir::Expression::variable(tag, token_tag),
-                    _ => {
-                        return Err(ShellError::type_error(
-                            "variable",
-                            token.type_name().tagged(token_tag),
-                        ))
-                    }
-                })
-            },
-        )
-    }
-}
-
-#[derive(Debug, Copy, Clone)]
-pub struct MemberShape;
-
-impl ExpandSyntax for MemberShape {
-    type Output = Tagged<String>;
-
-    fn expand<'a, 'b>(
-        &self,
-        token_nodes: &mut TokensIterator<'_>,
-        context: &ExpandContext,
-        source: &Text,
-        origin: uuid::Uuid,
-    ) -> Result<Tagged<String>, ShellError> {
-        let bare = BareShape.test(token_nodes, context, source, origin);
-        if let Some(peeked) = bare {
-            let node = peeked.not_eof("member")?.commit();
-            return Ok(node.tag().slice(source).to_string().tagged(node.tag()));
-        }
-
-        let string = StringShape.test(token_nodes, context, source, origin);
-
-        if let Some(peeked) = string {
-            let node = peeked.not_eof("member")?.commit();
-            let (outer, inner) = node.expect_string();
-
-            return Ok(inner.slice(source).to_string().tagged(outer));
-        }
-
-        Err(token_nodes.peek_any().type_error("member"))
     }
 }
 
 #[derive(Debug, Copy, Clone)]
 pub struct CommandHeadShape;
 
-impl ExpandExpression for CommandHeadShape {
-    fn expand<'a, 'b>(
+impl ExpandSyntax for CommandHeadShape {
+    type Output = CommandSignature;
+
+    fn expand_syntax<'a, 'b>(
         &self,
         token_nodes: &mut TokensIterator<'_>,
-        _context: &ExpandContext,
-        source: &Text,
-        origin: uuid::Uuid,
-    ) -> Result<hir::Expression, ShellError> {
-        parse_single_node(
-            token_nodes,
-            "command head",
-            source,
-            origin,
-            |token, token_tag| {
+        context: &ExpandContext,
+    ) -> Result<CommandSignature, ShellError> {
+        let node =
+            parse_single_node_skipping_ws(token_nodes, "command head1", |token, token_tag| {
                 Ok(match token {
-                    RawToken::ExternalCommand(tag) => {
-                        hir::Expression::external_command(tag, token_tag)
+                    RawToken::ExternalCommand(tag) => CommandSignature::LiteralExternal {
+                        outer: token_tag,
+                        inner: tag,
+                    },
+                    RawToken::Bare => {
+                        let name = token_tag.slice(context.source);
+                        if context.registry.has(name) {
+                            let command = context.registry.expect_command(name);
+                            CommandSignature::Internal(command.tagged(token_tag))
+                        } else {
+                            CommandSignature::External(token_tag)
+                        }
                     }
-                    RawToken::Bare => hir::RawExpression::Command.tagged(token_tag),
                     _ => {
                         return Err(ShellError::type_error(
-                            "command head",
+                            "command head2",
                             token.type_name().tagged(token_tag),
                         ))
                     }
                 })
+            });
+
+        match node {
+            Ok(expr) => return Ok(expr),
+            Err(_) => match expand_expr(&AnyExpressionShape, token_nodes, context) {
+                Ok(expr) => return Ok(CommandSignature::Expression(expr)),
+                Err(_) => Err(token_nodes.peek_non_ws().type_error("command head3")),
             },
-        )
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct ClassifiedCommandShape;
+
+impl ExpandSyntax for ClassifiedCommandShape {
+    type Output = ClassifiedCommand;
+
+    fn expand_syntax<'a, 'b>(
+        &self,
+        iterator: &'b mut TokensIterator<'a>,
+        context: &ExpandContext,
+    ) -> Result<Self::Output, ShellError> {
+        let head = expand_syntax(&CommandHeadShape, iterator, context)?;
+
+        match &head {
+            CommandSignature::Expression(expr) => Err(ShellError::syntax_error(
+                "Unexpected expression in command position".tagged(expr.tag),
+            )),
+
+            // If the command starts with `^`, treat it as an external command no matter what
+            CommandSignature::External(name) => {
+                let name_str = name.slice(&context.source);
+
+                external_command(iterator, &context.source, name_str.tagged(name))
+            }
+
+            CommandSignature::LiteralExternal { outer, inner } => {
+                let name_str = inner.slice(&context.source);
+
+                external_command(iterator, &context.source, name_str.tagged(outer))
+            }
+
+            CommandSignature::Internal(command) => {
+                let tail =
+                    parse_command_tail(&command.signature(), &context, iterator, command.tag)?;
+
+                let (positional, named) = match tail {
+                    None => (None, None),
+                    Some((positional, named)) => (positional, named),
+                };
+
+                let call = hir::Call {
+                    head: Box::new(head.to_expression()),
+                    positional,
+                    named,
+                };
+
+                Ok(ClassifiedCommand::Internal(InternalCommand::new(
+                    command.item.name().to_string(),
+                    command.tag,
+                    call,
+                )))
+            }
+        }
     }
 }
 
@@ -532,14 +487,12 @@ impl ExpandExpression for CommandHeadShape {
 pub struct InternalCommandHeadShape;
 
 impl ExpandExpression for InternalCommandHeadShape {
-    fn expand(
+    fn expand_expr(
         &self,
         token_nodes: &mut TokensIterator<'_>,
         _context: &ExpandContext,
-        _source: &Text,
-        _origin: uuid::Uuid,
     ) -> Result<hir::Expression, ShellError> {
-        let peeked_head = token_nodes.peek_non_ws().not_eof("command head")?;
+        let peeked_head = token_nodes.peek_non_ws().not_eof("command head4")?;
 
         let expr = match peeked_head.node {
             TokenNode::Token(
@@ -556,7 +509,7 @@ impl ExpandExpression for InternalCommandHeadShape {
 
             node => {
                 return Err(ShellError::type_error(
-                    "command head",
+                    "command head5",
                     node.tagged_type_name(),
                 ))
             }
@@ -568,32 +521,9 @@ impl ExpandExpression for InternalCommandHeadShape {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
-pub struct AnyExpressionShape;
-
-impl ExpandExpression for AnyExpressionShape {
-    fn expand<'a, 'b>(
-        &self,
-        _token_nodes: &mut TokensIterator<'_>,
-        _context: &ExpandContext,
-        _source: &Text,
-        _origin: uuid::Uuid,
-    ) -> Result<hir::Expression, ShellError> {
-        unimplemented!()
-    }
-}
-
-pub fn expand_file_path(string: &str, context: &ExpandContext) -> PathBuf {
-    let expanded = shellexpand::tilde_with_context(string, || context.homedir());
-
-    PathBuf::from(expanded.as_ref())
-}
-
 fn parse_single_node<'a, 'b, T>(
     token_nodes: &'b mut TokensIterator<'a>,
     expected: &'static str,
-    _source: &Text,
-    _origin: uuid::Uuid,
     callback: impl FnOnce(RawToken, Tag) -> Result<T, ShellError>,
 ) -> Result<T, ShellError> {
     let peeked = token_nodes.peek_any().not_eof(expected)?;
@@ -607,4 +537,124 @@ fn parse_single_node<'a, 'b, T>(
     peeked.commit();
 
     Ok(expr)
+}
+
+fn parse_single_node_skipping_ws<'a, 'b, T>(
+    token_nodes: &'b mut TokensIterator<'a>,
+    expected: &'static str,
+    callback: impl FnOnce(RawToken, Tag) -> Result<T, ShellError>,
+) -> Result<T, ShellError> {
+    let peeked = token_nodes.peek_non_ws().not_eof(expected)?;
+
+    let expr = match peeked.node {
+        TokenNode::Token(token) => callback(token.item, token.tag())?,
+
+        other => return Err(ShellError::type_error(expected, other.tagged_type_name())),
+    };
+
+    peeked.commit();
+
+    Ok(expr)
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct WhitespaceShape;
+
+impl ExpandSyntax for WhitespaceShape {
+    type Output = Tag;
+
+    fn expand_syntax<'a, 'b>(
+        &self,
+        token_nodes: &'b mut TokensIterator<'a>,
+        _context: &ExpandContext,
+    ) -> Result<Self::Output, ShellError> {
+        let peeked = token_nodes.peek_any().not_eof("whitespace")?;
+
+        let tag = match peeked.node {
+            TokenNode::Whitespace(tag) => *tag,
+
+            other => {
+                return Err(ShellError::type_error(
+                    "whitespace",
+                    other.tagged_type_name(),
+                ))
+            }
+        };
+
+        peeked.commit();
+
+        Ok(tag)
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct SpacedExpression<T: ExpandExpression> {
+    inner: T,
+}
+
+impl<T: ExpandExpression> ExpandExpression for SpacedExpression<T> {
+    fn expand_expr<'a, 'b>(
+        &self,
+        token_nodes: &'b mut TokensIterator<'a>,
+        context: &ExpandContext,
+    ) -> Result<hir::Expression, ShellError> {
+        // TODO: Make the name part of the trait
+        let peeked = token_nodes.peek_any().not_eof("whitespace")?;
+
+        match peeked.node {
+            TokenNode::Whitespace(_) => {
+                peeked.commit();
+                expand_expr(&self.inner, token_nodes, context)
+            }
+
+            other => Err(ShellError::type_error(
+                "whitespace",
+                other.tagged_type_name(),
+            )),
+        }
+    }
+}
+
+pub fn maybe_spaced<T: ExpandExpression>(inner: T) -> MaybeSpacedExpression<T> {
+    MaybeSpacedExpression { inner }
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct MaybeSpacedExpression<T: ExpandExpression> {
+    inner: T,
+}
+
+impl<T: ExpandExpression> ExpandExpression for MaybeSpacedExpression<T> {
+    fn expand_expr<'a, 'b>(
+        &self,
+        token_nodes: &'b mut TokensIterator<'a>,
+        context: &ExpandContext,
+    ) -> Result<hir::Expression, ShellError> {
+        // TODO: Make the name part of the trait
+        let peeked = token_nodes.peek_any().not_eof("whitespace")?;
+
+        match peeked.node {
+            TokenNode::Whitespace(_) => {
+                peeked.commit();
+                expand_expr(&self.inner, token_nodes, context)
+            }
+
+            _ => {
+                peeked.rollback();
+                expand_expr(&self.inner, token_nodes, context)
+            }
+        }
+    }
+}
+
+pub fn spaced<T: ExpandExpression>(inner: T) -> SpacedExpression<T> {
+    SpacedExpression { inner }
+}
+
+fn expand_variable(tag: Tag, token_tag: Tag, source: &Text) -> hir::Expression {
+    if tag.slice(source) == "it" {
+        hir::Expression::it_variable(tag, token_tag)
+    } else {
+        hir::Expression::variable(tag, token_tag)
+    }
 }

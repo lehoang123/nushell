@@ -1,6 +1,7 @@
 use crate::commands::Command;
 use crate::context::Context;
 use crate::errors::{ArgumentError, ShellError};
+use crate::parser::hir::syntax_shape::{expand_expr, spaced, ExpandExpression, WhitespaceShape};
 use crate::parser::registry::{NamedType, PositionalType, Signature};
 use crate::parser::{baseline_parse_tokens, TokensIterator};
 use crate::parser::{
@@ -12,52 +13,28 @@ use crate::{Tag, Tagged, Text};
 use log::trace;
 use std::sync::Arc;
 
-pub fn parse_command(
-    context: &Context,
-    head: Tagged<RawExpression>,
-    command: Arc<Command>,
-    body: Tagged<&mut TokensIterator>,
-    source: &Text,
-) -> Result<(hir::Call, Arc<Command>), ShellError> {
-    trace!("Processing {:?}", command.signature());
-
-    let call = match parse_command_tail(
-        &command.signature(),
-        &context.expand_context(body.tag.origin),
-        body.item,
-        source,
-        body.tag(),
-    )? {
-        None => hir::Call::new(Box::new(head), None, None),
-        Some((positional, named)) => hir::Call::new(Box::new(head), positional, named),
-    };
-
-    Ok((call, command))
-}
-
 pub fn parse_command_tail(
     config: &Signature,
     context: &ExpandContext,
     tail: &mut TokensIterator,
-    source: &Text,
     command_tag: Tag,
 ) -> Result<Option<(Option<Vec<hir::Expression>>, Option<NamedArguments>)>, ShellError> {
     let mut named = NamedArguments::new();
     let origin = command_tag.origin;
 
-    trace_remaining("nodes", tail.clone(), source);
+    trace_remaining("nodes", tail.clone(), context.source());
 
     for (name, kind) in &config.named {
         trace!(target: "nu::parse", "looking for {} : {:?}", name, kind);
 
         match kind {
             NamedType::Switch => {
-                let flag = extract_switch(name, tail, source);
+                let flag = extract_switch(name, tail, context.source());
 
                 named.insert_switch(name, flag);
             }
             NamedType::Mandatory(syntax_type) => {
-                match extract_mandatory(config, name, tail, source, command_tag) {
+                match extract_mandatory(config, name, tail, context.source(), command_tag) {
                     Err(err) => return Err(err), // produce a correct diagnostic
                     Ok((pos, flag)) => {
                         tail.move_to(pos);
@@ -70,48 +47,47 @@ pub fn parse_command_tail(
                             ));
                         }
 
-                        let expr = hir::baseline_parse_next_expr(
-                            tail,
-                            context,
-                            source,
-                            origin,
-                            *syntax_type,
-                        )?;
+                        let expr = expand_expr(&spaced(*syntax_type), tail, context)?;
 
                         tail.restart();
                         named.insert_mandatory(name, expr);
                     }
                 }
             }
-            NamedType::Optional(syntax_type) => match extract_optional(name, tail, source) {
-                Err(err) => return Err(err), // produce a correct diagnostic
-                Ok(Some((pos, flag))) => {
-                    tail.move_to(pos);
+            NamedType::Optional(syntax_type) => {
+                match extract_optional(name, tail, context.source()) {
+                    Err(err) => return Err(err), // produce a correct diagnostic
+                    Ok(Some((pos, flag))) => {
+                        tail.move_to(pos);
 
-                    if tail.at_end() {
-                        return Err(ShellError::argument_error(
-                            config.name.clone(),
-                            ArgumentError::MissingValueForName(name.to_string()),
-                            flag.tag(),
-                        ));
+                        if tail.at_end() {
+                            return Err(ShellError::argument_error(
+                                config.name.clone(),
+                                ArgumentError::MissingValueForName(name.to_string()),
+                                flag.tag(),
+                            ));
+                        }
+
+                        let expr = expand_expr(&spaced(*syntax_type), tail, context);
+
+                        match expr {
+                            Err(_) => named.insert_optional(name, None),
+                            Ok(expr) => named.insert_optional(name, Some(expr)),
+                        }
+
+                        tail.restart();
                     }
 
-                    let expr =
-                        hir::baseline_parse_next_expr(tail, context, source, origin, *syntax_type)?;
-
-                    tail.restart();
-                    named.insert_optional(name, Some(expr));
+                    Ok(None) => {
+                        tail.restart();
+                        named.insert_optional(name, None);
+                    }
                 }
-
-                Ok(None) => {
-                    tail.restart();
-                    named.insert_optional(name, None);
-                }
-            },
+            }
         };
     }
 
-    trace_remaining("after named", tail.clone(), source);
+    trace_remaining("after named", tail.clone(), context.source());
 
     let mut positional = vec![];
 
@@ -136,20 +112,30 @@ pub fn parse_command_tail(
             }
         }
 
-        let result =
-            hir::baseline_parse_next_expr(tail, context, source, origin, arg.syntax_type())?;
+        let result = expand_expr(&spaced(arg.syntax_type()), tail, context)?;
 
         positional.push(result);
     }
 
-    trace_remaining("after positional", tail.clone(), source);
+    trace_remaining("after positional", tail.clone(), context.source());
 
     if let Some(syntax_type) = config.rest_positional {
-        let remainder = baseline_parse_tokens(tail, context, source, origin, syntax_type)?;
-        positional.extend(remainder);
+        let mut out = vec![];
+
+        loop {
+            if tail.at_end_possible_ws() {
+                break;
+            }
+
+            let next = expand_expr(&spaced(syntax_type), tail, context)?;
+
+            out.push(next);
+        }
+
+        positional.extend(out);
     }
 
-    trace_remaining("after rest", tail.clone(), source);
+    trace_remaining("after rest", tail.clone(), context.source());
 
     trace!("Constructed positional={:?} named={:?}", positional, named);
 
